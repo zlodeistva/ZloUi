@@ -1,0 +1,14 @@
+ZloUi is an unofficial, open source Material You client for <a href="https://openwebui.com">Open WebUI</a> servers that you host yourself. It needs an account on such a server: the app provides no AI service of its own and sends data nowhere except to the server address you enter.
+
+Features:
+• Chats with history, search, pinning, archiving, renaming and cloning
+• Temporary chats that are not saved on the server
+• Model picker, web search, code interpreter, image generation, memory and tools (including MCP servers) configured on your server
+• Markdown replies, reasoning and tool call blocks, tappable source references
+• Generated and attached images: open full screen, zoom and save
+• Questions from the model (ask_user) answered right in the chat
+• Digital assistant: set the app as your default assistant to get a floating chat window from any screen, with a button to continue the conversation in the app
+• Material You colors or your own accent color, light and dark themes
+• English and Russian interface, following the system language by default
+
+Privacy: no ads, no analytics, no tracking. The only network connection is to the server you enter.
