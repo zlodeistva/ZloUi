@@ -49,6 +49,9 @@ class _ChatDrawerState extends State<ChatDrawer> {
   String? _error;
   String _query = '';
 
+  /// Incremented on every reload so stale responses are dropped.
+  int _generation = 0;
+
   @override
   void initState() {
     super.initState();
@@ -74,6 +77,7 @@ class _ChatDrawerState extends State<ChatDrawer> {
       _showArchived ? widget.loadArchived(page) : widget.loadChats(page);
 
   Future<void> _reload() async {
+    final generation = ++_generation;
     setState(() {
       _loading = true;
       _error = null;
@@ -90,7 +94,7 @@ class _ChatDrawerState extends State<ChatDrawer> {
           list = [...pinned, ...list.where((chat) => !ids.contains(chat.id))];
         } catch (_) {}
       }
-      if (!mounted) return;
+      if (!mounted || generation != _generation) return;
       setState(() {
         _chats
           ..clear()
@@ -99,19 +103,22 @@ class _ChatDrawerState extends State<ChatDrawer> {
         _done = _query.isNotEmpty || list.isEmpty;
       });
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _generation) return;
       setState(() => _error = '$error');
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && generation == _generation) {
+        setState(() => _loading = false);
+      }
     }
   }
 
   Future<void> _loadMore() async {
     if (_loading || _loadingMore || _done || _query.isNotEmpty) return;
+    final generation = _generation;
     setState(() => _loadingMore = true);
     try {
       final list = await _fetch(_page + 1);
-      if (!mounted) return;
+      if (!mounted || generation != _generation) return;
       final known = _chats.map((chat) => chat.id).toSet();
       final fresh = list.where((chat) => !known.contains(chat.id)).toList();
       setState(() {
