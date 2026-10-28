@@ -107,8 +107,6 @@ class ChatCodec {
       }
     }
 
-    if (text.isEmpty && toolCalls.isEmpty && reasoning.isEmpty) return null;
-
     final attachments = <ChatAttachment>[];
     final files = entry['files'];
     if (files is List) {
@@ -133,6 +131,13 @@ class ChatCodec {
           ChatAttachment(id: '', name: 'image', type: 'image', url: url),
         );
       }
+    }
+
+    if (text.isEmpty &&
+        toolCalls.isEmpty &&
+        reasoning.isEmpty &&
+        attachments.isEmpty) {
+      return null;
     }
 
     final usage = entry['usage'];
