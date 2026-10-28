@@ -76,6 +76,7 @@ class _ChatScreenState extends State<ChatScreen> {
   io.Socket? _socket;
   ChatMessage? _streamingMessage;
   String? _sessionId;
+  Completer<void>? _socketReady;
   String? _lastAssistantId;
   String? _eventChatId;
 
@@ -148,11 +149,20 @@ class _ChatScreenState extends State<ChatScreen> {
       onConnect: () {
         if (!mounted) return;
         setState(() => _sessionId = _socket?.id);
+        _socketReady?.complete();
+        _socketReady = null;
       },
       onDisconnect: () {
         if (!mounted) return;
         _clearLiveAskUser(notify: false);
         setState(() => _sessionId = null);
+        // Events of the running reply go to the old session and are lost.
+        if (_sending) {
+          _applyError(
+            Strings.of(context).t('connectionLost'),
+            _streamingMessage,
+          );
+        }
       },
     );
     _sessionId = _socket?.id;
@@ -261,6 +271,18 @@ class _ChatScreenState extends State<ChatScreen> {
           });
         }
     }
+  }
+
+  /// Replies arrive only through the socket: wait until it is connected.
+  Future<bool> _ensureSocket() async {
+    if (_sessionId != null) return true;
+    final ready = _socketReady ??= Completer<void>();
+    try {
+      await ready.future.timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      // Reported by the caller.
+    }
+    return mounted && _sessionId != null;
   }
 
   bool _isEphemeralChatId(String id) =>
@@ -1075,6 +1097,12 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted || _sending) return;
     }
 
+    if (!await _ensureSocket()) {
+      if (mounted) _showMessage(Strings.of(context).t('notConnected'));
+      return;
+    }
+    if (!mounted || _sending) return;
+
     FocusScope.of(context).unfocus();
 
     final userMessage = ChatMessage(
@@ -1184,6 +1212,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _regenerate(ChatMessage message) async {
     if (_sending) return;
+    if (!await _ensureSocket()) {
+      if (mounted) _showMessage(Strings.of(context).t('notConnected'));
+      return;
+    }
+    if (!mounted || _sending) return;
+
     final index = _messages.indexWhere((m) => m.id == message.id);
     if (index < 0) return;
 

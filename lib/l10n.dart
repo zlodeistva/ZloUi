@@ -163,6 +163,8 @@ class Strings {
       'askUserOtherHint': 'Введите ответ',
       'askUserRecommended': 'Рекомендуем',
       'askUserFailed': 'Не удалось отправить ответ: {error}',
+      'notConnected': 'Нет соединения с сервером, попробуйте ещё раз',
+      'connectionLost': 'Соединение с сервером прервано',
     },
     'en': {
       'appTitle': 'ZloUi',
@@ -308,6 +310,8 @@ class Strings {
       'askUserOtherHint': 'Type your answer',
       'askUserRecommended': 'Recommended',
       'askUserFailed': 'Could not send the answer: {error}',
+      'notConnected': 'Not connected to the server, try again',
+      'connectionLost': 'Connection to the server was lost',
     },
   };
 }
