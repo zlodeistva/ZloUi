@@ -405,8 +405,13 @@ class OpenWebUiApi {
 
   Future<Uint8List> fetchImage(String path) async {
     final uri = Uri.parse(path.startsWith('http') ? path : '$baseUrl$path');
+    // External images (e.g. from markdown in a reply) must not get the token.
+    final sameServer = uri.origin == Uri.parse(baseUrl).origin;
     final response = await http
-        .get(uri, headers: {'Authorization': 'Bearer $token'})
+        .get(
+          uri,
+          headers: sameServer ? {'Authorization': 'Bearer $token'} : null,
+        )
         .timeout(const Duration(seconds: 30));
     if (response.statusCode != 200) {
       throw ApiException(
