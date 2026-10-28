@@ -75,6 +75,9 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<ChatEvent>? _events;
   io.Socket? _socket;
   ChatMessage? _streamingMessage;
+
+  /// Replies stopped by the user: late events for them are ignored.
+  final Set<String> _stoppedMessageIds = {};
   String? _sessionId;
   Completer<void>? _socketReady;
   String? _lastAssistantId;
@@ -209,6 +212,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!isActiveChat) return;
 
     final message = _findMessage(event.messageId);
+    if (message != null && _stoppedMessageIds.contains(message.id)) return;
 
     switch (event.type) {
       case 'chat:completion':
@@ -1172,11 +1176,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _stop() {
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
-    final chatId = _chatId;
+    final chatId = _temporary
+        ? 'temporary:${_sessionId ?? _socket?.id ?? ''}'
+        : _chatId;
     final message = _streamingMessage;
-    if (chatId != null && !_temporary) {
+    if (chatId != null) {
       _api.stopGeneration(chatId).catchError((_) {});
     }
+    if (message != null) _stoppedMessageIds.add(message.id);
     setState(() {
       _sending = false;
       _streamingMessage = null;
