@@ -54,7 +54,7 @@ class Composer extends StatelessWidget {
         children: [
           IconButton(
             tooltip: s.t('attach'),
-            onPressed: enabled && !sending ? onAttach : null,
+            onPressed: enabled && !sending && !uploading ? onAttach : null,
             icon: uploading
                 ? const SizedBox(
                     width: 20,

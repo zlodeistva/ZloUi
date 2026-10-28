@@ -1284,6 +1284,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _pickAttachments({required bool imagesOnly}) async {
+    if (_uploading) return;
     final s = Strings.of(context);
     final maxCount = _config.maxFileCount;
     if (maxCount != null && _attachments.length >= maxCount) {
