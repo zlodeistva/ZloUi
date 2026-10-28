@@ -479,7 +479,10 @@ class OpenWebUiApi {
   }) async {
     final messages = <Map<String, dynamic>>[];
     for (final message in history) {
-      if (message.isNotice || message.content.trim().isEmpty) continue;
+      if (message.isNotice) continue;
+      if (message.content.trim().isEmpty && message.attachments.isEmpty) {
+        continue;
+      }
       messages.add(message.toJson());
     }
 
