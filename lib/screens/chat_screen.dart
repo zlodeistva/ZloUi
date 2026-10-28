@@ -662,6 +662,7 @@ class _ChatScreenState extends State<ChatScreen> {
           );
         }
       } else {
+        message.done = true;
         _messages.add(
           ChatMessage(
             role: 'assistant',
