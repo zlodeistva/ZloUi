@@ -1926,7 +1926,7 @@ class _ChatScreenState extends State<ChatScreen> {
               message.toolCalls.isEmpty &&
               message.reasoning.isEmpty,
           onCopy: () => _copyMessage(message),
-          onRegenerate: message.isAssistant && !_sending && !_temporary
+          onRegenerate: message.isAssistant && !_sending
               ? () => _regenerate(message)
               : null,
         );

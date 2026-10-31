@@ -232,17 +232,27 @@ class ChatBubble extends StatelessWidget {
 
     if (children.isEmpty) return const SizedBox.shrink();
 
-    final bubble = Container(
-      constraints: BoxConstraints(
-        maxWidth: MediaQuery.sizeOf(context).width * 0.85,
-      ),
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(color: color, borderRadius: radius),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: children,
+    final bubble = Material(
+      color: color,
+      borderRadius: radius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onRegenerate == null
+            ? null
+            : () => _showMessageMenu(context, s, onRegenerate!),
+        borderRadius: radius,
+        child: Container(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(context).width * 0.85,
+          ),
+          margin: const EdgeInsets.symmetric(vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: children,
+          ),
+        ),
       ),
     );
 
@@ -330,6 +340,29 @@ class ChatBubble extends StatelessWidget {
       listBullet: theme.textTheme.bodyMedium?.copyWith(color: textColor),
     );
   }
+}
+
+void _showMessageMenu(
+  BuildContext context,
+  Strings s,
+  VoidCallback onRegenerate,
+) {
+  showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (sheetContext) {
+      return SafeArea(
+        child: ListTile(
+          leading: const Icon(Icons.refresh_rounded),
+          title: Text(s.t('regenerate')),
+          onTap: () {
+            Navigator.pop(sheetContext);
+            onRegenerate();
+          },
+        ),
+      );
+    },
+  );
 }
 
 Future<void> _openLink(String href) async {
