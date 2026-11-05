@@ -47,7 +47,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: zloui-apk
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: "*.apk"
-          generate_release_notes: true
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" *.apk --clobber
