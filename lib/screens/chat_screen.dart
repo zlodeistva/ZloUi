@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:mime/mime.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
@@ -1284,7 +1285,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _pickAttachments({required bool imagesOnly}) async {
+  Future<void> _pickAttachments({
+    required bool imagesOnly,
+    bool camera = false,
+  }) async {
     if (_uploading) return;
     final s = Strings.of(context);
     final maxCount = _config.maxFileCount;
@@ -1293,15 +1297,31 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    final files = await FilePicker.pickFiles(
-      type: imagesOnly ? FileType.image : FileType.any,
-    );
-    if (files.isEmpty) return;
+    final List<({String name, Future<Uint8List> Function() read})> files;
+    if (camera) {
+      final XFile? photo;
+      try {
+        photo = await ImagePicker().pickImage(source: ImageSource.camera);
+      } catch (_) {
+        if (mounted) _showMessage(s.t('attachmentFailed'));
+        return;
+      }
+      if (photo == null) return;
+      files = [(name: photo.name, read: photo.readAsBytes)];
+    } else {
+      final picked = await FilePicker.pickFiles(
+        type: imagesOnly ? FileType.image : FileType.any,
+      );
+      files = [
+        for (final file in picked) (name: file.name, read: file.readAsBytes),
+      ];
+    }
+    if (files.isEmpty || !mounted) return;
 
     setState(() => _uploading = true);
     try {
       for (final file in files) {
-        final bytes = await file.readAsBytes();
+        final bytes = await file.read();
 
         final maxSize = _config.maxFileSize;
         if (maxSize != null && bytes.length > maxSize * 1024 * 1024) {
@@ -2071,6 +2091,14 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: Text(s.t('attachCamera')),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                _pickAttachments(imagesOnly: true, camera: true);
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.image_outlined),
               title: Text(s.t('attachImage')),

@@ -114,6 +114,7 @@ class Strings {
       'toolsSelected': 'Инструменты: {count}',
       'attachFile': 'Прикрепить файл',
       'attachImage': 'Прикрепить картинку',
+      'attachCamera': 'Сделать фото',
       'attachmentFailed': 'Не удалось загрузить файл',
       'removeAttachment': 'Убрать',
       'temporaryFilesUnsupported':
@@ -261,6 +262,7 @@ class Strings {
       'toolsSelected': 'Tools: {count}',
       'attachFile': 'Attach file',
       'attachImage': 'Attach image',
+      'attachCamera': 'Take photo',
       'attachmentFailed': 'Could not upload the file',
       'removeAttachment': 'Remove',
       'temporaryFilesUnsupported':
