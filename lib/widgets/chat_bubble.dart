@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../l10n.dart';
 import '../models.dart';
 import 'attachment_view.dart';
+import 'math_markdown.dart';
 
 class ChatBubble extends StatelessWidget {
   const ChatBubble({
@@ -185,8 +186,16 @@ class ChatBubble extends StatelessWidget {
       } else {
         children.add(
           MarkdownBody(
-            data: _linkCitations(message.content, message.sources),
+            data: prepareMathMarkdown(
+              _linkCitations(message.content, message.sources),
+            ),
             selectable: true,
+            inlineSyntaxes: [MathInlineSyntax()],
+            builders: {
+              'math': MathMarkdownBuilder(
+                style: theme.textTheme.bodyMedium?.copyWith(color: textColor),
+              ),
+            },
             onTapLink: (text, href, title) {
               if (href != null) _openLink(href);
             },
