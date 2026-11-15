@@ -1,3 +1,5 @@
+import 'dart:ui' show PlatformDispatcher;
+
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
@@ -12,10 +14,6 @@ class SpeechInput {
 
   /// No recognizer on this device; asking again will not help.
   bool _unavailable = false;
-
-  /// Resolved recognition locale, cached per interface language.
-  String? _localeLanguage;
-  String? _localeId;
 
   /// Callbacks of the current session. The plugin takes its status and error
   /// listeners only once, in initialize, so they forward to these.
@@ -71,7 +69,7 @@ class SpeechInput {
       _initialized = true;
     }
 
-    final localeId = await _localeFor(languageCode);
+    final localeId = _localeFor(languageCode);
     final prefix = baseText.isEmpty || baseText.endsWith(' ')
         ? baseText
         : '$baseText ';
@@ -115,27 +113,22 @@ class SpeechInput {
     } catch (_) {}
   }
 
-  /// Picks a locale for [languageCode], falling back to the system default
-  /// when the device does not offer one.
-  Future<String?> _localeFor(String languageCode) async {
+  /// Recognition locale for [languageCode], or null for the system default.
+  ///
+  /// The plugin's own locale list is not used: on Android 13+ its lookup
+  /// never completes when on-device recognition is missing or cannot report
+  /// its languages, which left the session stuck before it started. It also
+  /// lists on-device languages only. The recognizer takes a language tag
+  /// directly, so build one here.
+  String? _localeFor(String languageCode) {
     if (languageCode.isEmpty) return null;
-    if (_localeLanguage == languageCode) return _localeId;
-    String? resolved;
-    try {
-      final locales = await _speech.locales();
-      for (final locale in locales) {
-        if (locale.localeId.toLowerCase().startsWith(
-          languageCode.toLowerCase(),
-        )) {
-          resolved = locale.localeId;
-          break;
-        }
-      }
-    } catch (_) {}
-    _localeLanguage = languageCode;
-    _localeId = resolved;
-    return resolved;
+    final system = PlatformDispatcher.instance.locale;
+    // Same language as the system: keep the user's own region.
+    if (system.languageCode == languageCode) return null;
+    return _defaultTags[languageCode] ?? languageCode;
   }
+
+  static const _defaultTags = {'ru': 'ru-RU', 'en': 'en-US'};
 
   String _errorKey(SpeechRecognitionError error) {
     switch (error.errorMsg) {
