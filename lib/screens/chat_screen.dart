@@ -1065,12 +1065,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       onText: _onSpeechText,
       onDone: _onSpeechDone,
       onError: _onSpeechError,
+      onFinishing: _onSpeechFinishing,
     );
     if (!mounted) return;
     if (error != null) {
       _endListening();
       _showMessage(s.t(error));
+    } else if (!_listening) {
+      // Cancelled (chat switch, send) while the session was starting.
+      _speech.cancel();
+    } else if (_stoppingListening) {
+      // Stop was tapped while the session was starting (e.g. during the
+      // permission prompt): end the session that just began.
+      await _speech.stop();
     }
+  }
+
+  /// The recognizer stopped hearing (pause or stop); wait for the final words,
+  /// but not forever.
+  void _onSpeechFinishing() {
+    if (!mounted || !_listening) return;
+    _armListenTimeout();
+    if (!_stoppingListening) setState(() => _stoppingListening = true);
+  }
+
+  void _armListenTimeout() {
+    _listenTimeout?.cancel();
+    _listenTimeout = Timer(const Duration(seconds: 4), () {
+      if (mounted && _listening) _endListening();
+    });
   }
 
   void _onSpeechText(String text) {
@@ -1097,10 +1120,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _stopListening() async {
     if (!_listening || _stoppingListening) return;
     setState(() => _stoppingListening = true);
-    _listenTimeout?.cancel();
-    _listenTimeout = Timer(const Duration(seconds: 4), () {
-      if (mounted && _listening) _endListening();
-    });
+    _armListenTimeout();
     await _speech.stop();
   }
 

@@ -20,11 +20,15 @@ class SpeechInput {
   /// Callbacks of the current session. The plugin takes its status and error
   /// listeners only once, in initialize, so they forward to these.
   void Function()? _onDone;
+  void Function()? _onFinishing;
   void Function(String errorKey)? _onError;
 
   bool get isListening => _initialized && _speech.isListening;
 
   /// Starts a listen session.
+  ///
+  /// [onFinishing] reports that the microphone closed and the final result
+  /// is on its way; [onDone] follows once it has been delivered.
   ///
   /// [baseText] is the text already in the composer; recognized words are
   /// appended to it. [languageCode] is the interface language used to pick a
@@ -36,17 +40,23 @@ class SpeechInput {
     required void Function(String text) onText,
     required void Function() onDone,
     required void Function(String errorKey) onError,
+    void Function()? onFinishing,
   }) async {
     _onDone = onDone;
     _onError = onError;
+    _onFinishing = onFinishing;
     if (!_initialized) {
       if (_unavailable) return 'speechUnavailable';
       final available = await _speech.initialize(
         onError: (error) => _onError?.call(_errorKey(error)),
         onStatus: (status) {
-          if (status == SpeechToText.doneStatus ||
-              status == SpeechToText.notListeningStatus) {
+          // notListening comes before the final result: the recognizer
+          // stopped hearing but is still finishing the text. Only done
+          // guarantees the final words were delivered.
+          if (status == SpeechToText.doneStatus) {
             _onDone?.call();
+          } else if (status == SpeechToText.notListeningStatus) {
+            _onFinishing?.call();
           }
         },
       );
