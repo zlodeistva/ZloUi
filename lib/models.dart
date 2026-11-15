@@ -204,6 +204,12 @@ class ChatMessage {
 
   bool get isAssistant => role == 'assistant';
 
+  bool get hasContent =>
+      content.isNotEmpty ||
+      attachments.isNotEmpty ||
+      toolCalls.isNotEmpty ||
+      reasoning.isNotEmpty;
+
   String get plainText => content;
 
   Map<String, dynamic> toJson() => {

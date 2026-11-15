@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
@@ -188,6 +187,7 @@ class AttachmentImage extends StatefulWidget {
 class _AttachmentImageState extends State<AttachmentImage> {
   Uint8List? _bytes;
   bool _failed = false;
+  int _loadGeneration = 0;
 
   @override
   void initState() {
@@ -199,7 +199,10 @@ class _AttachmentImageState extends State<AttachmentImage> {
   void didUpdateWidget(covariant AttachmentImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.attachment.id != widget.attachment.id ||
-        oldWidget.attachment.url != widget.attachment.url) {
+        oldWidget.attachment.url != widget.attachment.url ||
+        oldWidget.attachment.localBytes != widget.attachment.localBytes ||
+        oldWidget.baseUrl != widget.baseUrl ||
+        oldWidget.token != widget.token) {
       _bytes = null;
       _failed = false;
       _load();
@@ -207,6 +210,7 @@ class _AttachmentImageState extends State<AttachmentImage> {
   }
 
   Future<void> _load() async {
+    final generation = ++_loadGeneration;
     final attachment = widget.attachment;
     final local = attachment.localBytes;
     if (local != null) {
@@ -216,13 +220,13 @@ class _AttachmentImageState extends State<AttachmentImage> {
 
     final url = attachment.url;
     if (url.startsWith('data:')) {
-      final comma = url.indexOf(',');
-      if (comma > 0) {
-        try {
-          setState(() => _bytes = base64Decode(url.substring(comma + 1)));
-          return;
-        } catch (_) {}
+      try {
+        final bytes = UriData.parse(url).contentAsBytes();
+        setState(() => _bytes = bytes);
+      } catch (_) {
+        setState(() => _failed = true);
       }
+      return;
     }
 
     if (attachment.id.isEmpty && url.isEmpty) {
@@ -238,10 +242,12 @@ class _AttachmentImageState extends State<AttachmentImage> {
           ? url
           : '/api/v1/files/${attachment.id.isNotEmpty ? attachment.id : url}/content';
       final bytes = await api.fetchImage(path);
-      if (!mounted) return;
+      if (!mounted || generation != _loadGeneration) return;
       setState(() => _bytes = bytes);
     } catch (_) {
-      if (mounted) setState(() => _failed = true);
+      if (mounted && generation == _loadGeneration) {
+        setState(() => _failed = true);
+      }
     }
   }
 
@@ -265,16 +271,14 @@ class _AttachmentImageState extends State<AttachmentImage> {
   }
 
   Widget _buildImage() {
-    {
-      return Image.memory(
-        _bytes!,
-        width: widget.width,
-        height: widget.height,
-        fit: widget.fit,
-        errorBuilder: (_, _, _) =>
-            widget.fallback ?? const Icon(Icons.broken_image_outlined),
-      );
-    }
+    return Image.memory(
+      _bytes!,
+      width: widget.width,
+      height: widget.height,
+      fit: widget.fit,
+      errorBuilder: (_, _, _) =>
+          widget.fallback ?? const Icon(Icons.broken_image_outlined),
+    );
   }
 
   Widget _buildPlaceholder() {

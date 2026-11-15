@@ -48,17 +48,38 @@ class OpenWebUiApi {
     'Accept': 'application/json',
   };
 
+  /// Runs [future] with [timeout], translating timeouts and connection
+  /// failures into [ApiException]s so every caller sees a consistent error.
+  Future<T> _guard<T>(
+    Future<T> future, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    try {
+      return await future.timeout(timeout);
+    } on ApiException {
+      rethrow;
+    } on TimeoutException {
+      throw ApiException('The server did not respond in time');
+    } on SocketException catch (error) {
+      throw ApiException('Network error: ${error.message}');
+    } on http.ClientException catch (error) {
+      throw ApiException('Network error: ${error.message}');
+    } catch (error) {
+      throw ApiException('Network error: $error');
+    }
+  }
+
   Future<Session> signIn({
     required String email,
     required String password,
   }) async {
-    final response = await http
-        .post(
-          Uri.parse('$baseUrl/api/v1/auths/signin'),
-          headers: const {'Content-Type': 'application/json'},
-          body: jsonEncode({'email': email.trim(), 'password': password}),
-        )
-        .timeout(const Duration(seconds: 30));
+    final response = await _guard(
+      http.post(
+        Uri.parse('$baseUrl/api/v1/auths/signin'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({'email': email.trim(), 'password': password}),
+      ),
+    );
 
     final body = _decodeBody(_bodyOf(response));
     if (response.statusCode != 200) {
@@ -311,6 +332,20 @@ class OpenWebUiApi {
     return id;
   }
 
+  /// Whether the server still runs a generation task for [chatId], or null
+  /// when the server does not expose task state.
+  Future<bool?> isChatGenerating(String chatId) async {
+    try {
+      final body = await _json('GET', '/api/tasks/chat/$chatId');
+      final ids = body is Map ? body['task_ids'] : null;
+      if (ids is! List) return null;
+      return ids.isNotEmpty;
+    } on ApiException catch (error) {
+      if (error.statusCode == 404 || error.statusCode == 405) return null;
+      rethrow;
+    }
+  }
+
   Future<void> stopGeneration(String chatId) async {
     await _json('POST', '/api/tasks/chat/$chatId/stop');
   }
@@ -354,8 +389,15 @@ class OpenWebUiApi {
       ),
     );
 
-    final streamed = await request.send().timeout(const Duration(seconds: 120));
-    final response = await http.Response.fromStream(streamed);
+    // Guard both phases: sending the body and reading the response.
+    final streamed = await _guard(
+      request.send(),
+      timeout: const Duration(seconds: 120),
+    );
+    final response = await _guard(
+      http.Response.fromStream(streamed),
+      timeout: const Duration(seconds: 120),
+    );
     final body = _decodeBody(_bodyOf(response));
     if (response.statusCode == 401) {
       throw ApiException('Session expired', statusCode: 401);
@@ -388,12 +430,13 @@ class OpenWebUiApi {
   }
 
   Future<Uint8List> downloadFile(String id) async {
-    final response = await http
-        .get(
-          Uri.parse('$baseUrl/api/v1/files/$id/content'),
-          headers: {'Authorization': 'Bearer $token'},
-        )
-        .timeout(const Duration(seconds: 60));
+    final response = await _guard(
+      http.get(
+        Uri.parse('$baseUrl/api/v1/files/$id/content'),
+        headers: {'Authorization': 'Bearer $token'},
+      ),
+      timeout: const Duration(seconds: 60),
+    );
     if (response.statusCode != 200) {
       throw ApiException(
         'Could not download file (HTTP ${response.statusCode})',
@@ -404,15 +447,24 @@ class OpenWebUiApi {
   }
 
   Future<Uint8List> fetchImage(String path) async {
-    final uri = Uri.parse(path.startsWith('http') ? path : '$baseUrl$path');
+    // Inline images (data URIs) never hit the network.
+    if (path.startsWith('data:')) {
+      final inline = Uri.tryParse(path)?.data;
+      if (inline != null) return inline.contentAsBytes();
+    }
+    final uri = Uri.parse(
+      path.startsWith('http')
+          ? path
+          : '$baseUrl${path.startsWith('/') ? path : '/$path'}',
+    );
     // External images (e.g. from markdown in a reply) must not get the token.
-    final sameServer = uri.origin == Uri.parse(baseUrl).origin;
-    final response = await http
-        .get(
-          uri,
-          headers: sameServer ? {'Authorization': 'Bearer $token'} : null,
-        )
-        .timeout(const Duration(seconds: 30));
+    final sameServer = _isSameServer(uri);
+    final response = await _guard(
+      http.get(
+        uri,
+        headers: sameServer ? {'Authorization': 'Bearer $token'} : null,
+      ),
+    );
     if (response.statusCode != 200) {
       throw ApiException(
         'Could not load image (HTTP ${response.statusCode})',
@@ -420,6 +472,15 @@ class OpenWebUiApi {
       );
     }
     return response.bodyBytes;
+  }
+
+  /// Same scheme, host and port: only then may the auth token be sent.
+  bool _isSameServer(Uri uri) {
+    final base = Uri.tryParse(baseUrl);
+    if (base == null || base.host.isEmpty) return false;
+    return uri.scheme == base.scheme &&
+        uri.host == base.host &&
+        uri.port == base.port;
   }
 
   /// Connects to the Open WebUI socket.io endpoint.
@@ -441,6 +502,9 @@ class OpenWebUiApi {
           .setAuth({'token': token})
           .disableAutoConnect()
           .enableReconnection()
+          // io.io caches managers per URL: without this a new screen (e.g.
+          // after signing in again) would reuse a manager with the old token.
+          .enableForceNew()
           .build(),
     );
 
@@ -530,7 +594,14 @@ class OpenWebUiApi {
       if (body['tool_ids'] == null) 'tool_ids': <dynamic>[],
     };
 
-    final result = await _json('POST', '/api/chat/completions', body$);
+    // The HTTP response arrives only after the generation completes (the
+    // reply itself streams over the socket), so allow long-running chats.
+    final result = await _json(
+      'POST',
+      '/api/chat/completions',
+      body$,
+      const Duration(minutes: 15),
+    );
     if (result is Map) {
       final newChatId = result['chat_id']?.toString();
       if (newChatId != null && newChatId.isNotEmpty) return newChatId;
@@ -538,43 +609,38 @@ class OpenWebUiApi {
     return null;
   }
 
-  Future<Object?> _json(String method, String path, [Object? payload]) async {
+  Future<Object?> _json(
+    String method,
+    String path, [
+    Object? payload,
+    Duration timeout = const Duration(seconds: 30),
+  ]) async {
     final uri = Uri.parse('$baseUrl$path');
-    try {
-      final Future<http.Response> request;
-      switch (method) {
-        case 'GET':
-          request = http.get(uri, headers: _headers);
-        case 'DELETE':
-          request = http.delete(uri, headers: _headers);
-        default:
-          request = http.post(
-            uri,
-            headers: _headers,
-            body: payload == null ? null : jsonEncode(payload),
-          );
-      }
-      final response = await request.timeout(const Duration(seconds: 30));
-      final body = _decodeBody(_bodyOf(response));
-      if (response.statusCode == 401) {
-        throw ApiException('Session expired', statusCode: 401);
-      }
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ApiException(
-          _detail(body) ?? 'Server error (HTTP ${response.statusCode})',
-          statusCode: response.statusCode,
+    final Future<http.Response> request;
+    switch (method) {
+      case 'GET':
+        request = http.get(uri, headers: _headers);
+      case 'DELETE':
+        request = http.delete(uri, headers: _headers);
+      default:
+        request = http.post(
+          uri,
+          headers: _headers,
+          body: payload == null ? null : jsonEncode(payload),
         );
-      }
-      return body;
-    } on TimeoutException {
-      throw ApiException('The server did not respond in time');
-    } on ApiException {
-      rethrow;
-    } on SocketException catch (error) {
-      throw ApiException('Network error: ${error.message}');
-    } catch (error) {
-      throw ApiException('Network error: $error');
     }
+    final response = await _guard(request, timeout: timeout);
+    final body = _decodeBody(_bodyOf(response));
+    if (response.statusCode == 401) {
+      throw ApiException('Session expired', statusCode: 401);
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        _detail(body) ?? 'Server error (HTTP ${response.statusCode})',
+        statusCode: response.statusCode,
+      );
+    }
+    return body;
   }
 
   String _bodyOf(http.Response response) =>

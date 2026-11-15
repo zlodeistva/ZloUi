@@ -76,10 +76,24 @@ class _ChatDrawerState extends State<ChatDrawer> {
   Future<List<ChatSummary>> _fetch(int page) =>
       _showArchived ? widget.loadArchived(page) : widget.loadChats(page);
 
+  void _fillViewport() {
+    final generation = _generation;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          generation != _generation ||
+          !_scrollController.hasClients) {
+        return;
+      }
+      final position = _scrollController.position;
+      if (position.maxScrollExtent <= 0) _loadMore();
+    });
+  }
+
   Future<void> _reload() async {
     final generation = ++_generation;
     setState(() {
       _loading = true;
+      _loadingMore = false;
       _error = null;
     });
     try {
@@ -108,6 +122,7 @@ class _ChatDrawerState extends State<ChatDrawer> {
     } finally {
       if (mounted && generation == _generation) {
         setState(() => _loading = false);
+        if (_error == null) _fillViewport();
       }
     }
   }
@@ -122,22 +137,24 @@ class _ChatDrawerState extends State<ChatDrawer> {
       final known = _chats.map((chat) => chat.id).toSet();
       final fresh = list.where((chat) => !known.contains(chat.id)).toList();
       setState(() {
-        if (fresh.isEmpty) {
-          _done = true;
-        } else {
-          _chats.addAll(fresh);
-          _page += 1;
-        }
+        _done = list.isEmpty;
+        _chats.addAll(fresh);
+        _page += 1;
       });
+      _fillViewport();
     } catch (_) {
-      if (mounted) setState(() => _done = true);
+      // A network failure is not the end of the list. Keep the page unchanged
+      // so scrolling again can retry it.
     } finally {
-      if (mounted) setState(() => _loadingMore = false);
+      if (mounted && generation == _generation) {
+        setState(() => _loadingMore = false);
+      }
     }
   }
 
   Future<void> _afterAction(Future<void> Function() action) async {
     await action();
+    if (!mounted) return;
     await _reload();
   }
 

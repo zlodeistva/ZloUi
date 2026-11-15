@@ -14,6 +14,7 @@ import '../ask_user.dart';
 import '../chat_codec.dart';
 import '../l10n.dart';
 import '../models.dart';
+import '../speech_input.dart';
 import '../store.dart';
 import '../stream_events.dart';
 import '../widgets/ask_user_card.dart';
@@ -50,7 +51,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   late final OpenWebUiApi _api;
   late final TextEditingController _inputController;
@@ -73,6 +74,7 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _title;
   bool _sending = false;
   bool _loadingChat = false;
+  int _conversationGeneration = 0;
   StreamSubscription<ChatEvent>? _events;
   io.Socket? _socket;
   ChatMessage? _streamingMessage;
@@ -83,6 +85,20 @@ class _ChatScreenState extends State<ChatScreen> {
   Completer<void>? _socketReady;
   String? _lastAssistantId;
   String? _eventChatId;
+
+  /// Temporary chat id the running reply was sent with. The session id in it
+  /// changes on reconnect, so stop must not rebuild it.
+  String? _streamingTemporaryChatId;
+
+  /// The socket dropped while a reply was streaming; resync on reconnect.
+  bool _streamInterrupted = false;
+
+  /// Gives up on an interrupted reply if the socket does not come back.
+  Timer? _reconnectGrace;
+
+  /// Detects a reply that went silent after a reconnect (temporary chats
+  /// cannot be re-read from the server).
+  Timer? _stallWatchdog;
 
   // ask_user
   AskUserPrompt? _liveAskUser;
@@ -100,6 +116,18 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<ChatAttachment> _attachments = [];
   bool _uploading = false;
 
+  final SpeechInput _speech = SpeechInput();
+  bool _listening = false;
+
+  /// Stop was requested; the last recognized words are still on their way.
+  bool _stoppingListening = false;
+
+  /// Fallback in case the platform never reports the end of the session.
+  Timer? _listenTimeout;
+
+  /// Text in the composer before dictation started.
+  String _speechBase = '';
+
   @override
   void initState() {
     super.initState();
@@ -110,6 +138,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _model = widget.store.model;
     _inputController = TextEditingController();
     widget.assistSignal?.addListener(_onAssist);
+    WidgetsBinding.instance.addObserver(this);
     _connectSocket();
     _loadInitialData();
     _refreshPrefs();
@@ -129,7 +158,12 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     widget.assistSignal?.removeListener(_onAssist);
+    WidgetsBinding.instance.removeObserver(this);
+    _reconnectGrace?.cancel();
+    _stallWatchdog?.cancel();
     _composerFocus.dispose();
+    _listenTimeout?.cancel();
+    _speech.cancel();
     _askUserTimeout?.cancel();
     _liveAskUserAck?.call({
       'status': 'cancelled',
@@ -155,27 +189,174 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() => _sessionId = _socket?.id);
         _socketReady?.complete();
         _socketReady = null;
+        if (_streamInterrupted) {
+          _streamInterrupted = false;
+          _reconnectGrace?.cancel();
+          _resyncStreamingReply();
+        }
       },
       onDisconnect: () {
         if (!mounted) return;
         _clearLiveAskUser(notify: false);
         setState(() => _sessionId = null);
-        // Events of the running reply go to the old session and are lost.
-        if (_sending) {
-          _applyError(
-            Strings.of(context).t('connectionLost'),
-            _streamingMessage,
-          );
+        // The server keeps generating while we are offline. Wait for the
+        // socket to come back and catch up instead of failing the reply.
+        final message = _streamingMessage;
+        if (_sending && message != null) {
+          _streamInterrupted = true;
+          _reconnectGrace?.cancel();
+          _reconnectGrace = Timer(const Duration(seconds: 30), () {
+            if (!mounted || !_streamInterrupted) return;
+            _streamInterrupted = false;
+            if (_sending && _streamingMessage == message) {
+              _applyError(Strings.of(context).t('connectionLost'), message);
+            }
+          });
+          setState(() {
+            message
+              ..statusText = Strings.of(context).t('reconnecting')
+              ..statusDone = false;
+          });
         }
       },
     );
     _sessionId = _socket?.id;
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) return;
+    // The OS may have frozen the app and dropped the connection silently.
+    final socket = _socket;
+    if (socket != null && socket.disconnected) {
+      socket.connect();
+    } else if (_sending && !_streamInterrupted) {
+      // Events may have been missed while the app was suspended.
+      _resyncStreamingReply();
+    }
+  }
+
+  /// Catches up with a reply whose live events may have been missed.
+  ///
+  /// Stored chats are re-read from the server; if the generation already
+  /// ended, the stored reply completes it. Temporary chats are not stored, so
+  /// only the live events can finish them: watch them for a stall instead.
+  Future<void> _resyncStreamingReply({String? reason}) async {
+    final message = _streamingMessage;
+    if (!mounted || !_sending || message == null) return;
+    final generation = _conversationGeneration;
+    final s = Strings.of(context);
+    final failure = reason ?? s.t('connectionLost');
+    final chatId = _chatId ?? _eventChatId;
+    if (message.statusText == s.t('reconnecting')) {
+      setState(() => message.statusText = null);
+    }
+
+    if (_temporary || chatId == null || _isEphemeralChatId(chatId)) {
+      if (message.hasContent || message.statusText != null) {
+        _armStallWatchdog(message, failure);
+      } else {
+        _applyError(failure, message);
+      }
+      return;
+    }
+
+    bool stillCurrent() =>
+        mounted &&
+        generation == _conversationGeneration &&
+        _sending &&
+        _streamingMessage == message;
+
+    try {
+      final generating = await _api.isChatGenerating(chatId);
+      final loaded = await _api.getChat(chatId);
+      if (!stillCurrent()) return;
+      ChatMessage? stored;
+      for (final candidate in loaded.messages) {
+        if (candidate.id == message.id) stored = candidate;
+      }
+      // Without task state, trust the stored reply's done flag.
+      final active =
+          generating ?? !(stored != null && stored.done && stored.hasContent);
+      if (stored != null &&
+          (!active || stored.content.length > message.content.length)) {
+        final source = stored;
+        setState(() {
+          message
+            ..content = source.content
+            ..output = source.output
+            ..reasoning = source.reasoning
+            ..toolCalls = source.toolCalls;
+          if (source.sources.isNotEmpty) message.sources = source.sources;
+          if (source.attachments.isNotEmpty) {
+            message.attachments = source.attachments;
+          }
+          if (source.usage != null) message.usage = source.usage;
+        });
+      }
+      if (active) {
+        // Still generating: the live events resume after user-join.
+        _armStallWatchdog(message, failure);
+        return;
+      }
+      final pendingAskUser = message.toolCalls.any(
+        (call) => call.name == 'ask_user' && call.status == 'pending',
+      );
+      if (pendingAskUser) {
+        setState(() {
+          _sending = false;
+          _streamingMessage = null;
+        });
+      } else if (stored != null && stored.hasContent) {
+        _finishSending(message);
+      } else {
+        _applyError(failure, message);
+      }
+    } on ApiException catch (error) {
+      if (!stillCurrent()) return;
+      if (error.isUnauthorized) {
+        _handleUnauthorized();
+        return;
+      }
+      _applyError(failure, message);
+    }
+  }
+
+  /// Fails [message] if no event arrives for it for a while.
+  void _armStallWatchdog(ChatMessage message, String reason) {
+    _stallWatchdog?.cancel();
+    _stallWatchdog = Timer(const Duration(seconds: 60), () {
+      _stallWatchdog = null;
+      if (!mounted || !_sending || _streamingMessage != message) return;
+      final chatId = _chatId ?? _eventChatId;
+      if (!_temporary && chatId != null && !_isEphemeralChatId(chatId)) {
+        // A long silent step (thinking, tools) is normal: ask the server.
+        _resyncStreamingReply(reason: reason);
+      } else {
+        _applyError(reason, message);
+      }
+    });
+  }
+
+  /// The HTTP request failed at the network level. The server may still have
+  /// received it and be generating, so check before reporting a failure.
+  void _recoverInterruptedReply(ChatMessage message, String reason) {
+    // A dropped socket resyncs by itself once it reconnects.
+    if (_streamInterrupted) return;
+    _resyncStreamingReply(reason: reason);
+  }
+
   void _handleEvent(ChatEvent event, [void Function(Object?)? ack]) {
     if (!mounted) return;
 
+    final isActiveChat = isCurrentChatEvent(
+      event,
+      chatId: _chatId ?? _eventChatId,
+      streamingMessageId: _streamingMessage?.id,
+      messageIds: _messages.map((message) => message.id),
+    );
     if (event.type == 'request:user_input') {
+      if (!isActiveChat) return;
       _handleLiveAskUser(event, ack);
       return;
     }
@@ -188,19 +369,11 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (_chatId == null &&
+        event.messageId == _streamingMessage?.id &&
         event.chatId.isNotEmpty &&
         !_isEphemeralChatId(event.chatId)) {
       _eventChatId = event.chatId;
     }
-
-    final isStreamingMessage =
-        event.messageId.isNotEmpty && event.messageId == _streamingMessage?.id;
-    final isActiveChat =
-        isStreamingMessage ||
-        (_chatId != null && event.chatId == _chatId) ||
-        (_chatId == null &&
-            (event.chatId.startsWith('temporary:') ||
-                event.chatId.startsWith('local:')));
 
     if (event.type == 'chat:title') {
       final title = event.text;
@@ -213,7 +386,15 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!isActiveChat) return;
 
     final message = _findMessage(event.messageId);
+    // An explicit unknown id belongs to another branch or an older reply.
+    // Only chat-level events may omit a message target.
+    if (event.messageId.isNotEmpty && message == null) return;
     if (message != null && _stoppedMessageIds.contains(message.id)) return;
+    if (_stallWatchdog != null &&
+        message != null &&
+        message == _streamingMessage) {
+      _armStallWatchdog(message, Strings.of(context).t('connectionLost'));
+    }
 
     switch (event.type) {
       case 'chat:completion':
@@ -451,6 +632,7 @@ class _ChatScreenState extends State<ChatScreen> {
     String action = 'answer',
     Map<String, dynamic>? answers,
   }) async {
+    final generation = _conversationGeneration;
     try {
       await _api.resolveToolCall(
         chatId: chatId,
@@ -460,8 +642,8 @@ class _ChatScreenState extends State<ChatScreen> {
         answers: answers,
       );
     } on ApiException catch (error) {
+      if (!mounted || generation != _conversationGeneration) return;
       _answeredAskUserCalls.remove(pending.callId);
-      if (!mounted) return;
       if (error.isUnauthorized) {
         _handleUnauthorized();
         return;
@@ -470,19 +652,19 @@ class _ChatScreenState extends State<ChatScreen> {
         Strings.of(context).t('askUserFailed', args: {'error': error.message}),
       );
       await _reloadCurrentChat();
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       setState(() {
         _sending = false;
         _streamingMessage = null;
       });
     } catch (error) {
+      if (!mounted || generation != _conversationGeneration) return;
       _answeredAskUserCalls.remove(pending.callId);
-      if (!mounted) return;
       _showMessage(
         Strings.of(context).t('askUserFailed', args: {'error': '$error'}),
       );
       await _reloadCurrentChat();
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       setState(() {
         _sending = false;
         _streamingMessage = null;
@@ -491,11 +673,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _reloadCurrentChat() async {
+    final generation = _conversationGeneration;
     final id = _chatId ?? _eventChatId;
     if (id == null || id.isEmpty || _isEphemeralChatId(id)) return;
     try {
       final loaded = await _api.getChat(id);
-      if (!mounted || id != (_chatId ?? _eventChatId)) return;
+      if (!mounted ||
+          generation != _conversationGeneration ||
+          id != (_chatId ?? _eventChatId)) {
+        return;
+      }
       setState(() {
         _messages
           ..clear()
@@ -520,7 +707,7 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final message in _messages.reversed) {
       if (message.id == id) return message;
     }
-    return _streamingMessage;
+    return null;
   }
 
   void _applyResponseCompletion(
@@ -535,6 +722,20 @@ class _ChatScreenState extends State<ChatScreen> {
       message.reasoning = outputReasoning(message.output);
       message.toolCalls = _toolCallsFrom(message.output);
     });
+    if (data['type'] == 'response.completed' &&
+        (_streamingMessage == null || _streamingMessage == message)) {
+      final pending = message.toolCalls.any(
+        (call) => call.name == 'ask_user' && call.status == 'pending',
+      );
+      if (pending) {
+        setState(() {
+          _sending = false;
+          _streamingMessage = null;
+        });
+      } else {
+        _finishSending(message);
+      }
+    }
     _scrollToBottom();
   }
 
@@ -552,7 +753,9 @@ class _ChatScreenState extends State<ChatScreen> {
       if (message == null) return;
     }
 
-    if (message.isAssistant && message.id.isNotEmpty) {
+    if (message.isAssistant &&
+        message.id.isNotEmpty &&
+        (_streamingMessage == null || _streamingMessage == message)) {
       _lastAssistantId = message.id;
     }
     if (data['sources'] != null) {
@@ -583,7 +786,8 @@ class _ChatScreenState extends State<ChatScreen> {
         final hasPendingAskUser = message.toolCalls.any(
           (call) => call.name == 'ask_user' && call.status == 'pending',
         );
-        if (hasPendingAskUser) {
+        if (hasPendingAskUser &&
+            (_streamingMessage == null || _streamingMessage == message)) {
           _sending = false;
           _streamingMessage = null;
         }
@@ -592,6 +796,12 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       });
       _scrollToBottom();
+      final error = errorFromPayload(data);
+      if (error != null) _applyError(error, message);
+      if (data['done'] == true) {
+        // A pending ask_user pauses generation instead of completing it.
+        _finishSending(message);
+      }
       return;
     }
 
@@ -602,9 +812,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final delta = choice['delta'];
         final choiceMessage = choice['message'];
         if (choiceMessage is Map && choiceMessage['content'] is String) {
-          setState(
-            () => message!.content += choiceMessage['content'] as String,
-          );
+          setState(() => message!.content = choiceMessage['content'] as String);
         } else if (delta is Map && delta['content'] is String) {
           setState(() => message!.content += delta['content'] as String);
         }
@@ -629,12 +837,17 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _handleCancelled(ChatMessage? message) {
+    if (_streamingMessage != null &&
+        message != null &&
+        message != _streamingMessage) {
+      return;
+    }
     setState(() {
       _sending = false;
       _streamingMessage = null;
       if (message != null) {
         message.done = true;
-        if (message.content.isEmpty && message.toolCalls.isEmpty) {
+        if (!message.hasContent) {
           message
             ..content = Strings(Localizations.localeOf(context).languageCode)
                 .t('generationStopped')
@@ -645,9 +858,17 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _applyError(String reason, ChatMessage? message) {
+    if (_streamingMessage != null &&
+        message != null &&
+        message != _streamingMessage) {
+      return;
+    }
     final s = Strings.of(context);
     setState(() {
-      if (message == null || message.content.isEmpty) {
+      if (message != null && message.statusText == s.t('reconnecting')) {
+        message.statusText = null;
+      }
+      if (message == null || !message.hasContent) {
         if (message != null) {
           message
             ..content = '${s.t('errorPrefix')}: $reason'
@@ -829,6 +1050,78 @@ class _ChatScreenState extends State<ChatScreen> {
       ..showSnackBar(SnackBar(content: Text(text)));
   }
 
+  /// Starts dictation, or stops it and keeps the recognized text.
+  Future<void> _toggleMic() async {
+    if (_listening) {
+      await _stopListening();
+      return;
+    }
+    final s = Strings.of(context);
+    _speechBase = _inputController.text;
+    setState(() => _listening = true);
+    final error = await _speech.start(
+      languageCode: s.languageCode,
+      baseText: _speechBase,
+      onText: _onSpeechText,
+      onDone: _onSpeechDone,
+      onError: _onSpeechError,
+    );
+    if (!mounted) return;
+    if (error != null) {
+      _endListening();
+      _showMessage(s.t(error));
+    }
+  }
+
+  void _onSpeechText(String text) {
+    if (!mounted || !_listening) return;
+    _inputController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+  }
+
+  void _onSpeechDone() {
+    if (!mounted) return;
+    _endListening();
+  }
+
+  void _onSpeechError(String errorKey) {
+    if (!mounted) return;
+    final wasListening = _listening;
+    _endListening();
+    if (wasListening) _showMessage(Strings.of(context).t(errorKey));
+  }
+
+  /// Ends the session but waits for the final recognized words.
+  Future<void> _stopListening() async {
+    if (!_listening || _stoppingListening) return;
+    setState(() => _stoppingListening = true);
+    _listenTimeout?.cancel();
+    _listenTimeout = Timer(const Duration(seconds: 4), () {
+      if (mounted && _listening) _endListening();
+    });
+    await _speech.stop();
+  }
+
+  /// Drops the session without waiting for a final result.
+  void _cancelListening() {
+    if (!_listening) return;
+    _speech.cancel();
+    _endListening();
+  }
+
+  void _endListening() {
+    _listenTimeout?.cancel();
+    _listenTimeout = null;
+    if (!mounted) return;
+    if (!_listening && !_stoppingListening) return;
+    setState(() {
+      _listening = false;
+      _stoppingListening = false;
+    });
+  }
+
   void _scrollToBottom({bool animate = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
@@ -862,11 +1155,13 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted) return;
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
     if (_sending) _stop();
+    _cancelListening();
 
+    final generation = ++_conversationGeneration;
     setState(() => _loadingChat = true);
     try {
       final loaded = await _api.getChat(id);
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       setState(() {
         _messages
           ..clear()
@@ -891,7 +1186,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_model.isNotEmpty) widget.store.saveModel(_model);
       _scrollToBottom(animate: false);
     } on ApiException catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (error.isUnauthorized) {
         _handleUnauthorized();
         return;
@@ -903,7 +1198,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   .t('openChatFailed', args: {'error': error.message}),
       );
     } finally {
-      if (mounted) setState(() => _loadingChat = false);
+      if (mounted && generation == _conversationGeneration) {
+        setState(() => _loadingChat = false);
+      }
     }
   }
 
@@ -912,8 +1209,11 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted) return;
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
     if (_sending) _stop();
+    _cancelListening();
 
+    _conversationGeneration++;
     setState(() {
+      _loadingChat = false;
       _messages.clear();
       _attachments.clear();
       _chatId = null;
@@ -1090,6 +1390,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _send() async {
     if (_sending || _loadingChat || _uploading) return;
+    final generation = _conversationGeneration;
+    // Late recognition results would repopulate the field we are clearing.
+    _cancelListening();
     final text = _inputController.text.trim();
     if (text.isEmpty && _attachments.isEmpty) return;
     if (_model.isEmpty) {
@@ -1100,14 +1403,14 @@ class _ChatScreenState extends State<ChatScreen> {
     final pending = _prefsFuture;
     if (_prefs == null && pending != null) {
       await pending;
-      if (!mounted || _sending) return;
+      if (!mounted || _sending || generation != _conversationGeneration) return;
     }
 
     if (!await _ensureSocket()) {
       if (mounted) _showMessage(Strings.of(context).t('notConnected'));
       return;
     }
-    if (!mounted || _sending) return;
+    if (!mounted || _sending || generation != _conversationGeneration) return;
 
     FocusScope.of(context).unfocus();
 
@@ -1147,41 +1450,49 @@ class _ChatScreenState extends State<ChatScreen> {
       final temporaryChatId = _temporary
           ? 'temporary:${_sessionId ?? _socket?.id ?? ''}'
           : null;
+      _streamingTemporaryChatId = temporaryChatId;
       final newChatId = await _api.sendMessage(
         model: _model,
         history: history,
         userMessage: userMessage,
         assistantMessage: assistantMessage,
-        chatId: temporaryChatId ?? _chatId,
+        chatId: temporaryChatId ?? _chatId ?? _eventChatId,
         sessionId: _sessionId,
         temporary: _temporary,
         parentId: _lastAssistantId,
         features: _features,
         toolIds: _selectedToolIds.toList(),
       );
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (!_temporary && newChatId != null) {
         setState(() => _chatId = newChatId);
       }
-      if (assistantMessage.content.isNotEmpty) {
-        _lastAssistantId = assistantMessage.id;
-      }
     } on ApiException catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (error.isUnauthorized) {
         _handleUnauthorized();
         return;
       }
-      _applyError(error.message, assistantMessage);
+      if (_streamingMessage == assistantMessage &&
+          !_stoppedMessageIds.contains(assistantMessage.id)) {
+        if (error.statusCode == null) {
+          _recoverInterruptedReply(assistantMessage, error.message);
+        } else {
+          _applyError(error.message, assistantMessage);
+        }
+      }
     }
   }
 
   void _stop() {
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
     final chatId = _temporary
-        ? 'temporary:${_sessionId ?? _socket?.id ?? ''}'
-        : _chatId;
+        ? _streamingTemporaryChatId ??
+              'temporary:${_sessionId ?? _socket?.id ?? ''}'
+        : _chatId ?? _eventChatId;
     final message = _streamingMessage;
+    _streamInterrupted = false;
+    _reconnectGrace?.cancel();
     if (chatId != null) {
       _api.stopGeneration(chatId).catchError((_) {});
     }
@@ -1191,7 +1502,13 @@ class _ChatScreenState extends State<ChatScreen> {
       _streamingMessage = null;
       if (message != null) {
         message.done = true;
-        if (message.content.isEmpty && message.toolCalls.isEmpty) {
+        if (message.statusText == Strings.of(context).t('reconnecting')) {
+          message.statusText = null;
+        }
+        if (message.isAssistant && message.hasContent && !message.isNotice) {
+          _lastAssistantId = message.id;
+        }
+        if (!message.hasContent) {
           message
             ..content = Strings.of(context).t('generationStopped')
             ..isNotice = true;
@@ -1202,14 +1519,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _finishSending(ChatMessage? message) {
     if (!mounted || !_sending) return;
+    if (message != null &&
+        _streamingMessage != null &&
+        message != _streamingMessage) {
+      return;
+    }
     setState(() {
       _sending = false;
       _streamingMessage = null;
       if (message != null) {
         message.done = true;
-        if (message.content.isEmpty &&
-            message.toolCalls.isEmpty &&
-            message.reasoning.isEmpty) {
+        if (message.isAssistant && message.hasContent && !message.isNotice) {
+          _lastAssistantId = message.id;
+        }
+        if (!message.hasContent) {
           message
             ..content = Strings.of(context).t('emptyResponse')
             ..isNotice = true;
@@ -1221,11 +1544,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _regenerate(ChatMessage message) async {
     if (_sending) return;
+    final generation = _conversationGeneration;
     if (!await _ensureSocket()) {
       if (mounted) _showMessage(Strings.of(context).t('notConnected'));
       return;
     }
-    if (!mounted || _sending) return;
+    if (!mounted || _sending || generation != _conversationGeneration) return;
 
     final index = _messages.indexWhere((m) => m.id == message.id);
     if (index < 0) return;
@@ -1240,6 +1564,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _messages.removeRange(userIndex + 1, _messages.length);
+      _lastAssistantId = userMessage.parentId;
     });
 
     final assistantMessage = ChatMessage(
@@ -1259,29 +1584,37 @@ class _ChatScreenState extends State<ChatScreen> {
       final temporaryChatId = _temporary
           ? 'temporary:${_sessionId ?? _socket?.id ?? ''}'
           : null;
+      _streamingTemporaryChatId = temporaryChatId;
       final newChatId = await _api.sendMessage(
         model: _model,
         history: _messages.sublist(0, userIndex + 1),
         userMessage: userMessage,
         assistantMessage: assistantMessage,
-        chatId: temporaryChatId ?? _chatId,
+        chatId: temporaryChatId ?? _chatId ?? _eventChatId,
         sessionId: _sessionId,
         temporary: _temporary,
         parentId: userMessage.parentId,
         features: _features,
         toolIds: _selectedToolIds.toList(),
       );
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (!_temporary && newChatId != null) {
         setState(() => _chatId = newChatId);
       }
     } on ApiException catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (error.isUnauthorized) {
         _handleUnauthorized();
         return;
       }
-      _applyError(error.message, assistantMessage);
+      if (_streamingMessage == assistantMessage &&
+          !_stoppedMessageIds.contains(assistantMessage.id)) {
+        if (error.statusCode == null) {
+          _recoverInterruptedReply(assistantMessage, error.message);
+        } else {
+          _applyError(error.message, assistantMessage);
+        }
+      }
     }
   }
 
@@ -1290,6 +1623,7 @@ class _ChatScreenState extends State<ChatScreen> {
     bool camera = false,
   }) async {
     if (_uploading) return;
+    final generation = _conversationGeneration;
     final s = Strings.of(context);
     final maxCount = _config.maxFileCount;
     if (maxCount != null && _attachments.length >= maxCount) {
@@ -1309,19 +1643,33 @@ class _ChatScreenState extends State<ChatScreen> {
       if (photo == null) return;
       files = [(name: photo.name, read: photo.readAsBytes)];
     } else {
-      final picked = await FilePicker.pickFiles(
-        type: imagesOnly ? FileType.image : FileType.any,
-      );
-      files = [
-        for (final file in picked) (name: file.name, read: file.readAsBytes),
-      ];
+      try {
+        final picked = await FilePicker.pickFiles(
+          type: imagesOnly ? FileType.image : FileType.any,
+        );
+        files = [
+          for (final file in picked) (name: file.name, read: file.readAsBytes),
+        ];
+      } catch (_) {
+        if (mounted && generation == _conversationGeneration) {
+          _showMessage(s.t('attachmentFailed'));
+        }
+        return;
+      }
     }
-    if (files.isEmpty || !mounted) return;
+    if (files.isEmpty || !mounted || generation != _conversationGeneration) {
+      return;
+    }
 
     setState(() => _uploading = true);
     try {
       for (final file in files) {
+        if (maxCount != null && _attachments.length >= maxCount) {
+          _showMessage(s.t('attachmentFailed'));
+          break;
+        }
         final bytes = await file.read();
+        if (!mounted || generation != _conversationGeneration) return;
 
         final maxSize = _config.maxFileSize;
         if (maxSize != null && bytes.length > maxSize * 1024 * 1024) {
@@ -1377,7 +1725,7 @@ class _ChatScreenState extends State<ChatScreen> {
             bytes: bytes,
             contentType: contentType,
           );
-          if (!mounted) return;
+          if (!mounted || generation != _conversationGeneration) return;
           setState(() {
             _attachments.add(
               ChatAttachment(
@@ -1394,14 +1742,16 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
     } on ApiException catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _conversationGeneration) return;
       if (error.isUnauthorized) {
         _handleUnauthorized();
       } else {
         _showMessage(s.t('attachmentFailed'));
       }
     } catch (error) {
-      if (mounted) _showMessage(s.t('attachmentFailed'));
+      if (mounted && generation == _conversationGeneration) {
+        _showMessage(s.t('attachmentFailed'));
+      }
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -1902,6 +2252,8 @@ class _ChatScreenState extends State<ChatScreen> {
                         onSend: _send,
                         onStop: _stop,
                         onAttach: () => _showAttachMenu(),
+                        listening: _listening,
+                        onMic: _toggleMic,
                       ),
                     ],
                   ),
@@ -2075,6 +2427,8 @@ class _ChatScreenState extends State<ChatScreen> {
               onSend: _send,
               onStop: _stop,
               onAttach: () => _showAttachMenu(),
+              listening: _listening,
+              onMic: _toggleMic,
             ),
           ],
         ),

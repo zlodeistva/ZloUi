@@ -2,6 +2,24 @@ import 'dart:convert';
 
 import 'models.dart';
 
+/// A shared socket can receive events for other chats and previous replies.
+bool isCurrentChatEvent(
+  ChatEvent event, {
+  required String? chatId,
+  required String? streamingMessageId,
+  required Iterable<String> messageIds,
+}) {
+  if (event.messageId.isNotEmpty && event.messageId == streamingMessageId) {
+    return true;
+  }
+  if (chatId != null && event.chatId == chatId) return true;
+  return chatId == null &&
+      (event.chatId.startsWith('temporary:') ||
+          event.chatId.startsWith('local:')) &&
+      event.messageId.isNotEmpty &&
+      messageIds.contains(event.messageId);
+}
+
 /// Applies `response:completion` events to the accumulated output array
 /// (mirrors applyResponseStreamEvent from the Open WebUI web client).
 List<Map<String, dynamic>> applyResponseEvent(
@@ -19,7 +37,9 @@ List<Map<String, dynamic>> applyResponseEvent(
     for (var i = 0; i < next.length; i++) {
       final candidate = next[i];
       if ((id != null && candidate['id'] == id) ||
-          (callId != null && candidate['call_id'] == callId)) {
+          (callId != null &&
+              candidate['call_id'] == callId &&
+              candidate['type'] == item['type'])) {
         return i;
       }
     }
@@ -29,8 +49,7 @@ List<Map<String, dynamic>> applyResponseEvent(
   int outputIndex(Map<String, dynamic> item) {
     final found = findIndex(item);
     if (found >= 0) return found;
-    return (event['output_index'] as num?)?.toInt() ??
-        (next.length - 1).clamp(0, 1 << 30);
+    return (event['output_index'] as num?)?.toInt() ?? next.length;
   }
 
   if (eventType == 'response.completed') {
@@ -57,9 +76,24 @@ List<Map<String, dynamic>> applyResponseEvent(
     final item = Map<String, dynamic>.from(raw);
     final index = findIndex(item);
     if (index >= 0) {
-      next[index] = item;
+      if (eventType == 'response.output_item.added') {
+        // A creation event can arrive after deltas. Keep accumulated data,
+        // while filling in metadata (type, name, call_id) from the real item.
+        final existing = next[index];
+        next[index] = {...existing, ...item};
+        for (final field in ['content', 'summary', 'arguments', 'code']) {
+          final value = existing[field];
+          if ((value is String && value.isNotEmpty) ||
+              (value is List && value.isNotEmpty)) {
+            next[index][field] = value;
+          }
+        }
+      } else {
+        next[index] = item;
+      }
     } else {
       final target = outputIndex(item);
+      if (target < 0) return output;
       if (target < next.length) {
         next.insert(target, item);
       } else {
@@ -69,7 +103,10 @@ List<Map<String, dynamic>> applyResponseEvent(
     return next;
   }
 
-  if (!eventType.endsWith('.delta') && !eventType.endsWith('.done')) {
+  if (!eventType.endsWith('.delta') &&
+      !eventType.endsWith('.done') &&
+      eventType != 'response.content_part.added' &&
+      eventType != 'response.reasoning_summary_part.added') {
     return output;
   }
 
@@ -80,21 +117,51 @@ List<Map<String, dynamic>> applyResponseEvent(
           (item) => item['id'] == itemId || item['call_id'] == itemId,
         );
   if (itemIndex < 0) {
-    itemIndex = (event['output_index'] as num?)?.toInt() ?? next.length - 1;
+    final explicitIndex = (event['output_index'] as num?)?.toInt();
+    if (explicitIndex != null && explicitIndex < 0) return output;
+    itemIndex =
+        explicitIndex ?? (itemId != null ? next.length : next.length - 1);
   }
   if (itemIndex < 0) itemIndex = 0;
 
   while (next.length <= itemIndex) {
-    next.add({'id': newId(), 'type': 'message', 'content': []});
+    final isTarget = next.length == itemIndex;
+    next.add({
+      'id': isTarget && itemId != null ? itemId : newId(),
+      'type': isTarget && eventType.startsWith('response.reasoning')
+          ? 'reasoning'
+          : 'message',
+      'content': [],
+    });
   }
 
   final item = next[itemIndex];
   final parts = eventType.split('.');
   final name = parts.length > 1 ? parts[1] : '';
 
+  if (name == 'content_part' || name == 'reasoning_summary_part') {
+    final raw = event['part'];
+    if (raw is! Map) return output;
+    final field = name == 'content_part' ? 'content' : 'summary';
+    final rawIndex =
+        event[name == 'content_part' ? 'content_index' : 'summary_index'];
+    final position = (rawIndex as num?)?.toInt() ?? 0;
+    if (position < 0) return output;
+    final existing = item[field];
+    final content = existing is List ? List<Object?>.of(existing) : <Object?>[];
+    while (content.length <= position) {
+      content.add({'type': 'output_text', 'text': ''});
+    }
+    content[position] = Map<String, dynamic>.from(raw);
+    item[field] = content;
+    return next;
+  }
+
   if (eventType.endsWith('.done')) {
     if (name == 'function_call_arguments' && event['arguments'] != null) {
       item['arguments'] = event['arguments'];
+    } else if (name == 'reasoning_summary_text' && event['text'] != null) {
+      _setPart(item, 'summary', event['summary_index'], event['text']);
     } else if ((name == 'output_text' ||
             name == 'text' ||
             name == 'reasoning_text') &&
@@ -129,9 +196,15 @@ void _appendPart(
 }) {
   final list = item[field];
   final parts = list is List
-      ? [for (final part in list) Map<String, dynamic>.from(part as Map)]
+      ? [
+          for (final part in list)
+            part is Map
+                ? Map<String, dynamic>.from(part)
+                : <String, dynamic>{'type': 'output_text', 'text': ''},
+        ]
       : <Map<String, dynamic>>[];
   final position = (index as num?)?.toInt() ?? 0;
+  if (position < 0) return;
   while (parts.length <= position) {
     parts.add({'type': 'output_text', 'text': ''});
   }
@@ -148,9 +221,15 @@ void _setPart(
 ) {
   final list = item[field];
   final parts = list is List
-      ? [for (final part in list) Map<String, dynamic>.from(part as Map)]
+      ? [
+          for (final part in list)
+            part is Map
+                ? Map<String, dynamic>.from(part)
+                : <String, dynamic>{'type': 'output_text', 'text': ''},
+        ]
       : <Map<String, dynamic>>[];
   final position = (index as num?)?.toInt() ?? 0;
+  if (position < 0) return;
   while (parts.length <= position) {
     parts.add({'type': 'output_text', 'text': ''});
   }
@@ -166,7 +245,7 @@ String outputText(List<Map<String, dynamic>> output) {
   final buffer = StringBuffer();
   for (final item in output) {
     if (item['type'] == 'message' || item['type'] == 'output_text') {
-      buffer.write(_textOf(item['content']));
+      buffer.write(_textOf(item['content'] ?? item['text']));
     }
   }
   return buffer.toString();
