@@ -18,7 +18,6 @@ A sleek Material You client for self-hosted [Open WebUI](https://openwebui.com) 
 - Markdown replies, reasoning and tool call blocks, tappable source references
 - Generated and attached images: full screen view, zoom, save
 - Questions from the model (`ask_user`) answered inside the chat
-- Voice input: dictate messages with the microphone button in the composer (device speech recognition)
 - Digital assistant: a floating chat window you can open from any screen, with a button to continue the conversation in the app
 - Material You or custom accent colors, light and dark themes
 - English and Russian interface (follows the system language by default)

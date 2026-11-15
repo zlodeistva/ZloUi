@@ -14,7 +14,6 @@ import '../ask_user.dart';
 import '../chat_codec.dart';
 import '../l10n.dart';
 import '../models.dart';
-import '../speech_input.dart';
 import '../store.dart';
 import '../stream_events.dart';
 import '../widgets/ask_user_card.dart';
@@ -116,18 +115,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final List<ChatAttachment> _attachments = [];
   bool _uploading = false;
 
-  final SpeechInput _speech = SpeechInput();
-  bool _listening = false;
-
-  /// Stop was requested; the last recognized words are still on their way.
-  bool _stoppingListening = false;
-
-  /// Fallback in case the platform never reports the end of the session.
-  Timer? _listenTimeout;
-
-  /// Text in the composer before dictation started.
-  String _speechBase = '';
-
   @override
   void initState() {
     super.initState();
@@ -162,8 +149,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _reconnectGrace?.cancel();
     _stallWatchdog?.cancel();
     _composerFocus.dispose();
-    _listenTimeout?.cancel();
-    _speech.cancel();
     _askUserTimeout?.cancel();
     _liveAskUserAck?.call({
       'status': 'cancelled',
@@ -1050,98 +1035,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ..showSnackBar(SnackBar(content: Text(text)));
   }
 
-  /// Starts dictation, or stops it and keeps the recognized text.
-  Future<void> _toggleMic() async {
-    if (_listening) {
-      await _stopListening();
-      return;
-    }
-    final s = Strings.of(context);
-    _speechBase = _inputController.text;
-    setState(() => _listening = true);
-    final error = await _speech.start(
-      languageCode: s.languageCode,
-      baseText: _speechBase,
-      onText: _onSpeechText,
-      onDone: _onSpeechDone,
-      onError: _onSpeechError,
-      onFinishing: _onSpeechFinishing,
-    );
-    if (!mounted) return;
-    if (error != null) {
-      _endListening();
-      _showMessage(s.t(error));
-    } else if (!_listening) {
-      // Cancelled (chat switch, send) while the session was starting.
-      _speech.cancel();
-    } else if (_stoppingListening) {
-      // Stop was tapped while the session was starting (e.g. during the
-      // permission prompt): end the session that just began.
-      await _speech.stop();
-    }
-  }
-
-  /// The recognizer stopped hearing (pause or stop); wait for the final words,
-  /// but not forever.
-  void _onSpeechFinishing() {
-    if (!mounted || !_listening) return;
-    _armListenTimeout();
-    if (!_stoppingListening) setState(() => _stoppingListening = true);
-  }
-
-  void _armListenTimeout() {
-    _listenTimeout?.cancel();
-    _listenTimeout = Timer(const Duration(seconds: 4), () {
-      if (mounted && _listening) _endListening();
-    });
-  }
-
-  void _onSpeechText(String text) {
-    if (!mounted || !_listening) return;
-    _inputController.value = TextEditingValue(
-      text: text,
-      selection: TextSelection.collapsed(offset: text.length),
-    );
-  }
-
-  void _onSpeechDone() {
-    if (!mounted) return;
-    _endListening();
-  }
-
-  void _onSpeechError(String errorKey) {
-    if (!mounted) return;
-    final wasListening = _listening;
-    _endListening();
-    if (wasListening) _showMessage(Strings.of(context).t(errorKey));
-  }
-
-  /// Ends the session but waits for the final recognized words.
-  Future<void> _stopListening() async {
-    if (!_listening || _stoppingListening) return;
-    setState(() => _stoppingListening = true);
-    _armListenTimeout();
-    await _speech.stop();
-  }
-
-  /// Drops the session without waiting for a final result.
-  void _cancelListening() {
-    if (!_listening) return;
-    _speech.cancel();
-    _endListening();
-  }
-
-  void _endListening() {
-    _listenTimeout?.cancel();
-    _listenTimeout = null;
-    if (!mounted) return;
-    if (!_listening && !_stoppingListening) return;
-    setState(() {
-      _listening = false;
-      _stoppingListening = false;
-    });
-  }
-
   void _scrollToBottom({bool animate = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
@@ -1175,7 +1068,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
     if (_sending) _stop();
-    _cancelListening();
 
     final generation = ++_conversationGeneration;
     setState(() => _loadingChat = true);
@@ -1229,7 +1121,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     if (_liveAskUser != null) _clearLiveAskUser(notify: true);
     if (_sending) _stop();
-    _cancelListening();
 
     _conversationGeneration++;
     setState(() {
@@ -1412,7 +1303,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (_sending || _loadingChat || _uploading) return;
     final generation = _conversationGeneration;
     // Late recognition results would repopulate the field we are clearing.
-    _cancelListening();
     final text = _inputController.text.trim();
     if (text.isEmpty && _attachments.isEmpty) return;
     if (_model.isEmpty) {
@@ -2272,8 +2162,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         onSend: _send,
                         onStop: _stop,
                         onAttach: () => _showAttachMenu(),
-                        listening: _listening,
-                        onMic: _toggleMic,
                       ),
                     ],
                   ),
@@ -2447,8 +2335,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               onSend: _send,
               onStop: _stop,
               onAttach: () => _showAttachMenu(),
-              listening: _listening,
-              onMic: _toggleMic,
             ),
           ],
         ),
