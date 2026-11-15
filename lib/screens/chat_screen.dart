@@ -95,6 +95,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Gives up on an interrupted reply if the socket does not come back.
   Timer? _reconnectGrace;
 
+  /// A reply lost its connection while the app was in the background. The
+  /// OS cuts the network there, so check it only once the app is back.
+  bool _resyncOnResume = false;
+
+  bool get _inForeground =>
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+
   /// Detects a reply that went silent after a reconnect (temporary chats
   /// cannot be re-read from the server).
   Timer? _stallWatchdog;
@@ -189,14 +196,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final message = _streamingMessage;
         if (_sending && message != null) {
           _streamInterrupted = true;
-          _reconnectGrace?.cancel();
-          _reconnectGrace = Timer(const Duration(seconds: 30), () {
-            if (!mounted || !_streamInterrupted) return;
-            _streamInterrupted = false;
-            if (_sending && _streamingMessage == message) {
-              _applyError(Strings.of(context).t('connectionLost'), message);
-            }
-          });
+          _armReconnectGrace(message);
           setState(() {
             message
               ..statusText = Strings.of(context).t('reconnecting')
@@ -208,16 +208,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _sessionId = _socket?.id;
   }
 
+  /// Fails [message] if the socket does not come back in time. In the
+  /// background the socket cannot reconnect, so the wait restarts on resume.
+  void _armReconnectGrace(ChatMessage message) {
+    _reconnectGrace?.cancel();
+    _reconnectGrace = Timer(const Duration(seconds: 30), () {
+      if (!mounted || !_streamInterrupted) return;
+      if (!_inForeground) {
+        _resyncOnResume = true;
+        return;
+      }
+      _streamInterrupted = false;
+      if (_sending && _streamingMessage == message) {
+        _applyError(Strings.of(context).t('connectionLost'), message);
+      }
+    });
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed || !mounted) return;
+    final deferred = _resyncOnResume;
+    _resyncOnResume = false;
+    final message = _streamingMessage;
     // The OS may have frozen the app and dropped the connection silently.
     final socket = _socket;
     if (socket != null && socket.disconnected) {
+      if (_sending && message != null) {
+        // Catch up once the socket is back, even if no disconnect event
+        // arrived for it.
+        _streamInterrupted = true;
+        _armReconnectGrace(message);
+      }
       socket.connect();
+    } else if (_sending && _streamInterrupted && message != null) {
+      _armReconnectGrace(message);
     } else if (_sending && !_streamInterrupted) {
       // Events may have been missed while the app was suspended.
-      _resyncStreamingReply();
+      _resyncStreamingReply(afterBackground: deferred);
     }
   }
 
@@ -226,7 +254,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Stored chats are re-read from the server; if the generation already
   /// ended, the stored reply completes it. Temporary chats are not stored, so
   /// only the live events can finish them: watch them for a stall instead.
-  Future<void> _resyncStreamingReply({String? reason}) async {
+  Future<void> _resyncStreamingReply({
+    String? reason,
+    bool afterBackground = false,
+  }) async {
     final message = _streamingMessage;
     if (!mounted || !_sending || message == null) return;
     final generation = _conversationGeneration;
@@ -238,7 +269,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     if (_temporary || chatId == null || _isEphemeralChatId(chatId)) {
-      if (message.hasContent || message.statusText != null) {
+      // After the background the reply may still arrive over the socket.
+      if (afterBackground ||
+          message.hasContent ||
+          message.statusText != null) {
         _armStallWatchdog(message, failure);
       } else {
         _applyError(failure, message);
@@ -303,6 +337,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _handleUnauthorized();
         return;
       }
+      if (error.statusCode == null && !_inForeground) {
+        _resyncOnResume = true;
+        return;
+      }
       _applyError(failure, message);
     }
   }
@@ -313,6 +351,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _stallWatchdog = Timer(const Duration(seconds: 60), () {
       _stallWatchdog = null;
       if (!mounted || !_sending || _streamingMessage != message) return;
+      if (!_inForeground) {
+        _resyncOnResume = true;
+        return;
+      }
       final chatId = _chatId ?? _eventChatId;
       if (!_temporary && chatId != null && !_isEphemeralChatId(chatId)) {
         // A long silent step (thinking, tools) is normal: ask the server.
@@ -328,6 +370,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _recoverInterruptedReply(ChatMessage message, String reason) {
     // A dropped socket resyncs by itself once it reconnects.
     if (_streamInterrupted) return;
+    // In the background the OS resets connections and blocks the network:
+    // the server keeps generating, so check once the app is back.
+    if (!_inForeground) {
+      _resyncOnResume = true;
+      return;
+    }
     _resyncStreamingReply(reason: reason);
   }
 
@@ -1403,6 +1451,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final message = _streamingMessage;
     _streamInterrupted = false;
     _reconnectGrace?.cancel();
+    _resyncOnResume = false;
     if (chatId != null) {
       _api.stopGeneration(chatId).catchError((_) {});
     }
