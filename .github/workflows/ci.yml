@@ -60,3 +60,5 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes
           fi
           gh release upload "$TAG" *.apk --clobber
+          # Deleting and re-pushing a tag turns its release into a draft.
+          gh release edit "$TAG" --draft=false
